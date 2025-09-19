@@ -1,0 +1,94 @@
+name: Conditional Star linera-protocol
+
+on:
+  workflow_dispatch:
+    inputs:
+      username:
+        description: 'GitHub username to evaluate'
+        required: true
+        default: ''
+
+permissions:
+  contents: read
+
+jobs:
+  check-and-star:
+    runs-on: ubuntu-latest
+    env:
+      OWNER: linera-io
+      REPO: linera-protocol
+    steps:
+      - name: Checkout (needed for Actions context)
+        uses: actions/checkout@v4
+
+      - name: Validate inputs & ensure PAT secret exists
+        run: |
+          if [ -z "${{ github.event.inputs.username }}" ]; then
+            echo "Error: username input is required."
+            exit 1
+          fi
+          if [ -z "${{ secrets.USER_PAT }}" ]; then
+            echo "Error: please add your personal access token to repo secrets as USER_PAT."
+            exit 1
+          fi
+
+      - name: Check account age and commits, then star if eligible
+        uses: actions/github-script@v6
+        with:
+          script: |
+            const username = core.getInput('username') || process.env.INPUT_USERNAME || process.env['GITHUB_EVENT_INPUTS_USERNAME'] || '${{ github.event.inputs.username }}';
+            const token = process.env.USER_PAT || process.env['USER_PAT'] || '${{ secrets.USER_PAT }}';
+            if (!username) throw new Error('username not provided');
+
+            const octokit = github.getOctokit(token);
+
+            // 1) Get user info (created_at)
+            const { data: user } = await octokit.request('GET /users/{username}', { username });
+            const createdAt = new Date(user.created_at);
+            const now = new Date();
+            const sixMonthsAgo = new Date(now);
+            sixMonthsAgo.setMonth(sixMonthsAgo.getMonth() - 6);
+
+            core.info(`User ${username} created at ${createdAt.toISOString()}`);
+            if (createdAt > sixMonthsAgo) {
+              core.info(`Account is younger than 6 months (created ${createdAt.toISOString()}). Will NOT star.`);
+              return;
+            }
+            core.info('Account is older than 6 months — passes first check.');
+
+            // 2) Check for at least one commit in the last year.
+            const oneYearAgo = new Date(now);
+            oneYearAgo.setFullYear(oneYearAgo.getFullYear() - 1);
+            const sinceDate = oneYearAgo.toISOString().split('T')[0]; // YYYY-MM-DD
+
+            // Use the commit search API for author-date — requires preview header
+            const q = `author:${username} committer-date:>=${sinceDate}`;
+
+            core.info(`Searching commits with query: ${q}`);
+
+            const resp = await octokit.request('GET /search/commits', {
+              q,
+              per_page: 1,
+              headers: { accept: 'application/vnd.github.cloak-preview+json' }
+            });
+
+            const commitsFound = resp.data.total_count || 0;
+            core.info(`Found ${commitsFound} commits by ${username} since ${sinceDate}`);
+
+            if (commitsFound < 1) {
+              core.info('No commits in the last year — will NOT star.');
+              return;
+            }
+
+            core.info('Found at least one commit in the last year — passes second check.');
+
+            // 3) Star the repository on behalf of the authenticated user
+            const owner = process.env.OWNER;
+            const repo = process.env.REPO;
+            await octokit.request('PUT /user/starred/{owner}/{repo}', {
+              owner,
+              repo,
+              headers: { accept: 'application/vnd.github.v3+json' }
+            });
+
+            core.info(`Repository ${owner}/${repo} successfully starred for user ${username}.`);
